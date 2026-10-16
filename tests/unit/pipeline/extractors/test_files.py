@@ -1,8 +1,11 @@
 import bz2
 import csv
 import gzip
+import importlib.util
 import json
+import logging
 import typing
+import zipfile
 from pathlib import Path
 from tempfile import NamedTemporaryFile, TemporaryDirectory
 from typing import AsyncIterator
@@ -13,11 +16,16 @@ import yaml
 from hamcrest import assert_that, equal_to
 
 from nodestream.pipeline.extractors.files import (
+    SUPPORTED_ARCHIVE_FORMAT_REGISTRY,
+    SUPPORTED_FILE_FORMAT_REGISTRY,
+    FileCodec,
     FileExtractor,
     FileSource,
     LocalFileSource,
     ReadableFile,
     RemoteFileSource,
+    ZipArchive,
+    _is_data_member,
 )
 
 SIMPLE_RECORD = {"record": "value"}
@@ -381,3 +389,191 @@ async def test_unified_extractor_multiple_source_types(json_file, csv_file, http
     )
     results = [r async for r in subject.extract_records()]
     assert_that(results, equal_to([SIMPLE_RECORD] * 4))
+
+
+def _warning_message(logger) -> str:
+    logger.warning.assert_called_once()
+    args = logger.warning.call_args.args
+    return args[0] % args[1:]
+
+
+async def _records_from(path: Path):
+    subject = FileExtractor([LocalFileSource([path])])
+    return [record async for record in subject.extract_records()]
+
+
+@pytest.mark.asyncio
+async def test_suffix_lookup_is_case_insensitive(base_dir: str):
+    path = Path(base_dir) / "DATA.JSON"
+    path.write_text(json.dumps(SIMPLE_RECORD), encoding="utf-8")
+    assert await _records_from(path) == [SIMPLE_RECORD]
+
+
+@pytest.mark.asyncio
+async def test_zip_reads_csv_and_skips_directories(base_dir: str):
+    archive_path = Path(base_dir) / "notes.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("notes.csv", "record\nvalue\n")
+        archive.writestr("folder/", b"")
+        archive.writestr("__MACOSX/._notes.csv", b"not a csv")
+    assert await _records_from(archive_path) == [SIMPLE_RECORD]
+
+
+def _corrupt_zip_member_crc(path: Path, member: str) -> None:
+    """Flip one stored payload byte so the member's CRC no longer matches."""
+    with zipfile.ZipFile(path) as archive:
+        offset = archive.getinfo(member).header_offset
+    raw = bytearray(path.read_bytes())
+    name_len = int.from_bytes(raw[offset + 26 : offset + 28], "little")
+    extra_len = int.from_bytes(raw[offset + 28 : offset + 30], "little")
+    data_start = offset + 30 + name_len + extra_len
+    raw[data_start] ^= 0xFF
+    path.write_bytes(raw)
+
+
+@pytest.mark.asyncio
+async def test_zip_bad_member_does_not_drop_later_members(
+    base_dir: str, mocker, caplog
+):
+    archive_path = Path(base_dir) / "bundle.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("a_corrupt.csv", "record\nvalue\n")
+        archive.writestr("a_bad.json", b"this is not json")
+        archive.writestr("b_good.csv", "record\nvalue\n")
+    _corrupt_zip_member_crc(archive_path, "a_corrupt.csv")
+    subject = FileExtractor([LocalFileSource([archive_path])])
+    subject.logger = mocker.Mock()
+    with caplog.at_level(
+        logging.WARNING, logger="nodestream.pipeline.extractors.files"
+    ):
+        records = [record async for record in subject.extract_records()]
+    assert records == [SIMPLE_RECORD]
+    warning = " ".join(
+        str(arg) for call in subject.logger.warning.call_args_list for arg in call.args
+    )
+    assert "a_bad.json" in warning
+    assert "a_corrupt.csv" in caplog.text
+    assert "b_good.csv" not in warning
+    assert "b_good.csv" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_zip_encrypted_member_does_not_drop_later_members(
+    base_dir: str, mocker, caplog
+):
+    archive_path = Path(base_dir) / "bundle.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("first.csv", "record\nfirst\n")
+        archive.writestr("secret.csv", "record\nsecret\n")
+        archive.writestr("notes.csv", "record\nvalue\n")
+        # Traditional encryption is flag bit 0. ZipFile.open raises
+        # RuntimeError for that flag when no password is supplied.
+        archive.getinfo("secret.csv").flag_bits |= 1
+    subject = FileExtractor([LocalFileSource([archive_path])])
+    subject.logger = mocker.Mock()
+    with caplog.at_level(
+        logging.WARNING, logger="nodestream.pipeline.extractors.files"
+    ):
+        records = [record async for record in subject.extract_records()]
+    assert records == [{"record": "first"}, SIMPLE_RECORD]
+    subject.logger.warning.assert_not_called()
+    assert (
+        f"Skipping member secret.csv in {archive_path} that could not be unpacked: "
+    ) in caplog.text
+    assert "is encrypted, password required for extraction" in caplog.text
+    assert "first.csv" not in caplog.text
+    assert "notes.csv" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_zip_skips_oversized_members(base_dir: str, monkeypatch, caplog):
+    limit = 32
+    monkeypatch.setattr(ZipArchive, "max_member_bytes", limit)
+    archive_path = Path(base_dir) / "bundle.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("big.csv", "x" * (limit + 1))
+        archive.writestr("notes.csv", "record\nvalue\n")
+    with caplog.at_level(
+        logging.WARNING, logger="nodestream.pipeline.extractors.files"
+    ):
+        assert await _records_from(archive_path) == [SIMPLE_RECORD]
+    size_gb = f"{(limit + 1) / 1024**3:.1f} GB"
+    limit_gb = f"{limit / 1024**3:.1f} GB"
+    assert (
+        "Skipping oversized member big.csv in "
+        f"{archive_path} ({size_gb} > {limit_gb} limit, ZipArchive.max_member_bytes)"
+    ) in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_invalid_zip_logs_the_unpack_error(base_dir: str, mocker):
+    path = Path(base_dir) / "bad.zip"
+    path.write_bytes(b"this is not a zip file")
+    subject = FileExtractor([LocalFileSource([path])])
+    subject.logger = mocker.Mock()
+    assert [record async for record in subject.extract_records()] == []
+    message = _warning_message(subject.logger)
+    assert message.startswith(f"Failed to read archive {path}.")
+    assert message.endswith("File is not a zip file")
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("tables/one.sas7bdat", True),
+        ("tables\\one.sas7bdat", True),
+        ("/tables/one.sas7bdat", True),
+        ("one.SAS7BDAT", True),
+        ("notes/readme.txt", True),
+        ("folder/", False),
+        ("", False),
+        ("__MACOSX/._one.sas7bdat", False),
+        ("tables/._one.sas7bdat", False),
+    ],
+)
+def test_is_data_member(name, expected):
+    assert _is_data_member(name) is expected
+
+
+def test_zip_is_an_archive_codec_not_a_file_format():
+    assert ".zip" in SUPPORTED_ARCHIVE_FORMAT_REGISTRY
+    assert ".zip" not in SUPPORTED_FILE_FORMAT_REGISTRY
+
+    class PluginZip(FileCodec, alias=".zip"):
+        def read_file_from_handle(self, reader):
+            return []
+
+    try:
+        assert SUPPORTED_FILE_FORMAT_REGISTRY.get(".zip") is PluginZip
+    finally:
+        del SUPPORTED_FILE_FORMAT_REGISTRY.registry[".zip"]
+
+
+@pytest.mark.asyncio
+async def test_file_extractor_loads_format_plugins(base_dir: str, mocker):
+    module_path = Path(base_dir) / "demo_format.py"
+    module_path.write_text(
+        "from nodestream.pipeline.extractors.files import FileCodec\n"
+        "\n"
+        "class DemoFormat(FileCodec, alias='.demoplug'):\n"
+        "    def read_file_from_handle(self, reader, source=None):\n"
+        "        return [{'body': reader.read().decode(), 'source': source}]\n",
+        encoding="utf-8",
+    )
+
+    def load():
+        spec = importlib.util.spec_from_file_location("demo_format_plugin", module_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    entrypoint = mocker.Mock()
+    entrypoint.load.side_effect = load
+    mocker.patch.object(FileCodec, "entrypoints", return_value=[entrypoint])
+    path = Path(base_dir) / "sample.demoplug"
+    path.write_text("hello", encoding="utf-8")
+    try:
+        assert await _records_from(path) == [{"body": "hello", "source": str(path)}]
+        entrypoint.load.assert_called_once()
+    finally:
+        SUPPORTED_FILE_FORMAT_REGISTRY.registry.pop(".demoplug", None)

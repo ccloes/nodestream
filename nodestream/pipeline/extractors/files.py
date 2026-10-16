@@ -3,13 +3,15 @@ import gzip
 import json
 import sys
 import tempfile
+import zipfile
 from abc import ABC, abstractmethod
 from contextlib import asynccontextmanager
 from csv import DictReader
 from glob import glob
+from inspect import signature
 from io import BufferedReader, BytesIO, IOBase, TextIOWrapper
 from logging import getLogger
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import (
     Any,
     AsyncContextManager,
@@ -32,9 +34,37 @@ from ...subclass_registry import MissingFromRegistryError, SubclassRegistry
 from .credential_utils import AwsClientFactory
 from .extractor import Extractor
 
+LOGGER = getLogger(__name__)
+
 SUPPORTED_FILE_FORMAT_REGISTRY = SubclassRegistry()
 SUPPORTED_COMPRESSED_FILE_FORMAT_REGISTRY = SubclassRegistry()
+SUPPORTED_ARCHIVE_FORMAT_REGISTRY = SubclassRegistry()
 SUPPORTED_FILE_SOURCES_REGISTRY = SubclassRegistry()
+
+
+def _lookup_codec(registry: SubclassRegistry, suffix: str):
+    """Resolve a codec by suffix, ignoring case.
+
+    `.JSON` and `.json` select the same codec. Compression, archive, and
+    file-format lookups all go through this helper.
+    """
+    try:
+        return registry.get(suffix)
+    except MissingFromRegistryError:
+        return registry.get(suffix.lower())
+
+
+def _read_codec_records(codec: "FileCodec", reader: IOBase, source: str):
+    """Read records, passing the file name when the codec accepts it.
+
+    Built-in codecs take only the reader. A plugin codec can add a `source`
+    argument when a log message should name the original file instead of a
+    temporary path.
+    """
+    read = codec.read_file_from_handle
+    if "source" in signature(read).parameters:
+        return read(reader, source=source)
+    return read(reader)
 
 
 class Utf8TextIOWrapper(TextIOWrapper):
@@ -207,6 +237,10 @@ class FileCodec(Pluggable, ABC):
     words, if you don't define the `reader` attribute, the file will be read
     as a binary file. If you want to read the file as a text file, you should
     define the `reader` attribute as TextIOWrapper.
+
+    A plugin adds a format by subclassing this class in a module published as
+    the `file_formats` entry point. `FileExtractor` imports those modules.
+    The subclass may accept a `source` keyword with the original file name.
     """
 
     reader = None
@@ -259,6 +293,26 @@ class CompressionCodec(Pluggable, ABC):
         remove the .gz suffix. And store it in an intermediary file which can
         be read by the file format codec (.txt in this case).
         """
+        raise NotImplementedError
+
+
+@SUPPORTED_ARCHIVE_FORMAT_REGISTRY.connect_baseclass
+class ArchiveCodec(Pluggable, ABC):
+    """Base class for archive codecs.
+
+    An archive is a container of named members, not a file format. Expanding
+    an archive yields one readable file per member so each member is parsed
+    by the codec for its own suffix.
+    """
+
+    entrypoint_name = "archive_formats"
+
+    def __init__(self, file: ReadableFile) -> None:
+        self.file = file
+
+    @abstractmethod
+    def members(self) -> AsyncIterator[ReadableFile]:
+        """Yield one readable file per archive member."""
         raise NotImplementedError
 
 
@@ -447,6 +501,87 @@ class Bz2FileFormat(CompressionCodec, alias=".bz2"):
                     temp_file.write(decompressor.decompress(chunk))
             temp_file.seek(0)
             yield TempFile(new_path, temp_file, str(self.file))
+
+
+def _is_data_member(name: str) -> bool:
+    """Return whether a zip member should be parsed.
+
+    Directory entries and macOS metadata (`__MACOSX/`, AppleDouble `._*`
+    files) are not data files. The check is about the member name, not the
+    format.
+    """
+    normalized = name.replace("\\", "/").lstrip("/")
+    if not normalized or normalized.endswith("/"):
+        return False
+    if normalized.startswith("__MACOSX/") or "/__MACOSX/" in f"/{normalized}":
+        return False
+    filename = PurePosixPath(normalized).name
+    return bool(filename) and not filename.startswith("._")
+
+
+def _format_gb(num_bytes: int) -> str:
+    return f"{num_bytes / 1024**3:.1f} GB"
+
+
+class ZipArchive(ArchiveCodec, alias=".zip"):
+    """Archive codec for zip files.
+
+    Members are extracted one at a time onto disk and handed back to the
+    file extractor, which selects a codec from the member suffix. A member
+    that cannot be unpacked, or that fails while it is parsed, does not stop
+    the members after it.
+
+    `max_member_bytes` skips members whose uncompressed size is larger than
+    the cap so a zip bomb cannot expand without bound.
+    """
+
+    max_member_bytes = 2 * 1024**3
+
+    async def members(self) -> AsyncIterator[ReadableFile]:
+        async with self.file.as_reader(BufferedReader) as reader:
+            with zipfile.ZipFile(reader) as archive:
+                for info in archive.infolist():
+                    if not _is_data_member(info.filename):
+                        continue
+                    member_name = info.filename.replace("\\", "/")
+                    if info.file_size > self.max_member_bytes:
+                        LOGGER.warning(
+                            "Skipping oversized member %s in %s "
+                            "(%s > %s limit, ZipArchive.max_member_bytes)",
+                            member_name,
+                            self.file,
+                            _format_gb(info.file_size),
+                            _format_gb(self.max_member_bytes),
+                        )
+                        continue
+                    suffix = "".join(PurePosixPath(member_name).suffixes)
+                    with tempfile.NamedTemporaryFile(suffix=suffix) as temp_file:
+                        try:
+                            with archive.open(info) as src:
+                                for chunk in iter(lambda: src.read(1024 * 1024), b""):
+                                    temp_file.write(chunk)
+                        except (
+                            zipfile.BadZipFile,
+                            NotImplementedError,
+                            OSError,
+                            # Encrypted members raise RuntimeError when no
+                            # password is set. Keep that inside this member
+                            # so later members are still read.
+                            RuntimeError,
+                        ) as exc:
+                            LOGGER.warning(
+                                "Skipping member %s in %s that could not be unpacked: %s",
+                                member_name,
+                                self.file,
+                                exc,
+                            )
+                            continue
+                        temp_file.seek(0)
+                        yield TempFile(
+                            Path(temp_file.name),
+                            temp_file,
+                            f"{self.file}!{member_name}",
+                        )
 
 
 class LocalFileSource(FileSource, alias="local"):
@@ -734,6 +869,9 @@ class FileExtractor(Extractor):
     def __init__(self, file_sources: Sequence[FileSource]) -> None:
         self.file_sources = file_sources
         self.logger = getLogger(__name__)
+        # Plugins register by subclassing these bases in an entry-point module.
+        FileCodec.import_all()
+        ArchiveCodec.import_all()
 
     async def read_file(
         self,
@@ -749,7 +887,9 @@ class FileExtractor(Extractor):
             # the decompressed file in an intermediary file. The intermediary
             # file will be read by the file format codec.
             try:
-                algo = SUPPORTED_COMPRESSED_FILE_FORMAT_REGISTRY.get(suffix)(file)
+                algo = _lookup_codec(SUPPORTED_COMPRESSED_FILE_FORMAT_REGISTRY, suffix)(
+                    file
+                )
                 decompression = algo.decompress_file()
                 file = await decompression.__aenter__()
                 intermediaries.append(decompression)
@@ -765,13 +905,34 @@ class FileExtractor(Extractor):
                 )
                 break
 
+            # Archives expand into members. Each member is parsed on its own,
+            # so a bad member does not drop the members that follow it.
+            try:
+                archive_type = _lookup_codec(SUPPORTED_ARCHIVE_FORMAT_REGISTRY, suffix)
+            except MissingFromRegistryError:
+                archive_type = None
+            if archive_type is not None:
+                try:
+                    async for member in archive_type(file).members():
+                        async for record in self.read_file(member):
+                            yield record
+                except Exception as e:
+                    self.logger.warning(
+                        "Failed to read archive %s. "
+                        "Please ensure the file is in the correct format: %s",
+                        file,
+                        e,
+                        extra={"exception": str(e)},
+                    )
+                break
+
             # If we didn't find a compression codec, try to find a file format
             # codec that can read the file. If a file format codec is found,
             # read the file and yield the records.
             try:
-                codec = SUPPORTED_FILE_FORMAT_REGISTRY.get(suffix)()
+                codec = _lookup_codec(SUPPORTED_FILE_FORMAT_REGISTRY, suffix)()
                 async with file.as_reader(codec.reader or BufferedReader) as reader:
-                    for record in codec.read_file_from_handle(reader):
+                    for record in _read_codec_records(codec, reader, str(file)):
                         yield record
             except MissingFromRegistryError:
                 # If we didn't find a file format codec, break out of the loop
