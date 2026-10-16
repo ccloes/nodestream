@@ -57,6 +57,12 @@ Conviced? Install nodestream with `pip` to get started.
 
 We highly recommend following our tutorials [here](https://nodestream-proj.github.io/docs/docs/category/tutorial---basics/)
 
+### Reading files
+
+`FileExtractor` reads `.json`, `.jsonl`, `.csv`, `.yaml`, `.txt`, and `.parquet`. Suffix case is ignored, so `.JSON` uses the same codec as `.json`. `.gz` and `.bz2` are decompressed first. A `.zip` archive is expanded one member at a time, and each member is read by its own suffix.
+
+Another package can add a format by subclassing `FileCodec` and publishing a `file_formats` entry point in the `nodestream.plugins` group. `nodestream-plugin-sas` does this for `.sas7bdat`.
+
 ## Packages 
 
 Nodestream is built on a Highly Pluggable and Modular Architecture. Thus... we have a lot of packages to keep track of. 
@@ -72,6 +78,7 @@ Nodestream is built on a Highly Pluggable and Modular Architecture. Thus... we h
 | `nodestream-plugin-sbom`     	| Import SBOM files in CycloneDX and SPDX into an opinionated graph data model. 	| ![PyPI Version](https://badge.fury.io/py/nodestream-plugin-sbom.svg)         	|
 | `nodestream-plugin-akamai`   	| Parse Akamai properties, redirect configs, and much more and ingests them.    	| ![PyPI Version](https://badge.fury.io/py/nodestream-plugin-akamai.svg)     	|
 | `nodestream-plugin-k8s`      	| In incubation. A plugin that orchestrates Nodestream on k8s.                  	| ![PyPI Version](https://badge.fury.io/py/nodestream-plugin-k8s.svg)           	|
+| `nodestream-plugin-sas`      	| Read `.sas7bdat` files with `FileExtractor`.                                   	| [source](nodestream-plugin-sas)                     	|
 
 
 ## Contributors
