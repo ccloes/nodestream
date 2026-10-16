@@ -78,7 +78,7 @@ Nodestream is built on a Highly Pluggable and Modular Architecture. Thus... we h
 | `nodestream-plugin-sbom`     	| Import SBOM files in CycloneDX and SPDX into an opinionated graph data model. 	| ![PyPI Version](https://badge.fury.io/py/nodestream-plugin-sbom.svg)         	|
 | `nodestream-plugin-akamai`   	| Parse Akamai properties, redirect configs, and much more and ingests them.    	| ![PyPI Version](https://badge.fury.io/py/nodestream-plugin-akamai.svg)     	|
 | `nodestream-plugin-k8s`      	| In incubation. A plugin that orchestrates Nodestream on k8s.                  	| ![PyPI Version](https://badge.fury.io/py/nodestream-plugin-k8s.svg)           	|
-| `nodestream-plugin-sas`      	| Read `.sas7bdat` files with `FileExtractor`.                                   	| [GitHub](https://github.com/ccloes/nodestream-plugin-sas)                     	|
+| `nodestream-plugin-sas`      	| Read `.sas7bdat` files with `FileExtractor`.                                   	| [source](nodestream-plugin-sas)                     	|
 
 
 ## Contributors
